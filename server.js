@@ -1,153 +1,178 @@
-/* Deloitte Careers Demo Assistant — Dialogflow ES Webhook
-   Endpoint: POST /df-webhook
-   Notes:
-   - Routes by intent.displayName (ES). Also supports CX tag if present.
-   - Returns simple text messages (fulfillmentText). Safe for demo.
-*/
-
+/* USI Careers Concierge — Dialogflow ES webhook */
 const express = require("express");
-const cors = require("cors");
-require("dotenv").config();
-
+const fetch = require("node-fetch");
+const cheerio = require("cheerio");
 const app = express();
-app.use(cors());
 app.use(express.json());
 
-const TZ = process.env.TZ || "Asia/Kolkata";
-process.env.TZ = TZ;
+const LINKS = {
+  usi_overview: [
+    "https://www2.deloitte.com/in/en/careers.html",
+    "https://www2.deloitte.com/in/en/pages/about-deloitte/articles/deloitte-us-india-offices.html"
+  ],
+  practices: {
+    "Consulting": ["https://www2.deloitte.com/in/en/pages/strategy-operations/solutions/consulting.html"],
+    "Risk Advisory": ["https://www2.deloitte.com/in/en/pages/risk/solutions/risksolutions.html"],
+    "Audit & Assurance": ["https://www2.deloitte.com/in/en/pages/audit/topics/audit-and-assurance.html"],
+    "Tax": ["https://www2.deloitte.com/in/en/pages/tax/topics/tax-services.html"],
+    "Technology": ["https://www2.deloitte.com/in/en/pages/technology.html"],
+    "Financial Advisory": ["https://www2.deloitte.com/in/en/pages/financial-advisory.html"]
+  },
+  culture: [
+    "https://www2.deloitte.com/in/en/pages/careers/articles/life-at-deloitte.html",
+    "https://www2.deloitte.com/global/en/pages/about-deloitte/articles/deloitte-inclusion.html"
+  ],
+  innovation: [
+    "https://www2.deloitte.com/in/en/pages/technology/topics/analytics-and-cognitive.html",
+    "https://www2.deloitte.com/global/en/pages/consulting/solutions/deloitte-ai-institute.html"
+  ],
+  hiring: [
+    "https://jobsindia.deloitte.com/",
+    "https://www2.deloitte.com/in/en/pages/careers/topics/campus-recruitment.html"
+  ],
+  locations: ["Bengaluru","Hyderabad","Gurugram","Mumbai","Pune","Chennai","Kolkata","Coimbatore"]
+};
 
-// Helpers
-const pad = (n) => (n < 10 ? "0" + n : "" + n);
+function bullet(list) { return list.map(x => `• ${x}`).join("\n"); }
 
-function toISTISO(d) {
-  const year = d.getFullYear();
-  const month = pad(d.getMonth() + 1);
-  const day = pad(d.getDate());
-  const hour = pad(d.getHours());
-  const min = pad(d.getMinutes());
-  const sec = pad(d.getSeconds());
-  return `${year}-${month}-${day}T${hour}:${min}:${sec}+05:30`;
-}
+async function searchRoles(keyword, practice, location) {
+  let query = [];
+  if (keyword) query.push(keyword);
+  if (practice) query.push(practice);
+  const q = encodeURIComponent(query.join(" "));
+  const loc = location ? encodeURIComponent(location) : "";
+  const url = `https://jobsindia.deloitte.com/search/?q=${q}${loc ? `&locationsearch=${loc}` : ""}`;
 
-function nextSlots() {
-  const now = new Date();
-  const d1 = new Date(now.getTime()); d1.setHours(11,0,0,0);
-  const d2 = new Date(now.getTime()); d2.setHours(15,0,0,0);
-  const d3 = new Date(now.getTime() + 24*60*60*1000); d3.setHours(10,30,0,0);
-  return [toISTISO(d1), toISTISO(d2), toISTISO(d3)];
-}
-
-function mockRoles(practice, location) {
-  const p = practice || "Consulting";
-  const loc = location || "Bengaluru";
-  return [
-    { title: `${p} Analyst (Campus)`, location: loc, reqId: "R-CA-1001", applyUrl: "https://careers.example.com/apply/R-CA-1001" },
-    { title: `${p} Business Analyst`, location: loc, reqId: "R-BA-2033", applyUrl: "https://careers.example.com/apply/R-BA-2033" },
-    { title: `${p} Associate`, location: loc, reqId: "R-AS-3177", applyUrl: "https://careers.example.com/apply/R-AS-3177" }
-  ];
-}
-
-function parseYear(gradYearParam) {
-  if (!gradYearParam) return null;
-  const s = String(gradYearParam);
-  const m = s.match(/^(\d{4})/);
-  return m ? parseInt(m[1], 10) : null;
-}
-
-function eligibility(degree, gradYearParam, expYearsParam) {
-  const goodDegrees = new Set(["BTech","BE","CA","MBA","MTech","MCA"]);
-  const year = parseYear(gradYearParam);
-  const exp = typeof expYearsParam === "number" ? expYearsParam : parseFloat(expYearsParam || "0");
-  const currentYear = new Date().getFullYear();
-
-  let score = 0;
-  if (degree && goodDegrees.has(String(degree))) score += 1;
-  if (year && year >= currentYear - 2) score += 1;
-  if (!isNaN(exp) && exp >= 1) score += 1;
-
-  if (score >= 2) return "Likely eligible";
-  if (score === 1) return "Borderline";
-  return "Not eligible (demo heuristic)";
-}
-
-const statuses = ["Received", "Under Review", "Interview Scheduled", "Offer in Progress"];
-
-function textResponse(res, text) {
-  res.json({
-    fulfillmentText: text,
-    source: "deloitte-careers-demo-webhook"
-  });
-}
-
-app.get("/", (_req, res) => res.send("Deloitte Careers Demo Assistant — Webhook OK"));
-
-app.post("/df-webhook", (req, res) => {
   try {
-    const body = req.body || {};
-    const cxTag = body.fulfillmentInfo?.tag; // CX
-    const qr = body.queryResult || {};
+    const html = await (await fetch(url, {timeout: 8000})).text();
+    const $ = cheerio.load(html);
+    const results = [];
+    $("a.jobTitle-link, a.jobTitle").each((_, el) => {
+      const title = $(el).text().trim();
+      const href = $(el).attr("href");
+      if (title && href) results.push({title, href: new URL(href, url).href});
+    });
+    if (results.length === 0) {
+      $("a[href]").each((_, el) => {
+        const t = $(el).text().trim();
+        const h = $(el).attr("href");
+        if (h && /(\/job\/|\/jobs\/)/i.test(h) && t) {
+          results.push({title: t, href: new URL(h, url).href});
+        }
+      });
+    }
+    return { url, results: results.slice(0,5) };
+  } catch (e) {
+    return { url, results: [] };
+  }
+}
+
+function practiceSummary(name) {
+  const n = String(name || "").toLowerCase();
+  if (n.includes("consult")) return "Consulting at USI spans Strategy & Analytics, Human Capital, and Core Business Operations. Typical roles: Business Analyst, Consultant, Solution Analyst (tech), Specialist. Work includes digital transformation, operating models, cloud modernization and analytics-driven decisions.";
+  if (n.includes("risk")) return "Risk Advisory covers Cyber, Regulatory & Legal, and Strategic Risk. Roles include Risk Analyst, Cyber Analyst, Risk Consultant. Work includes cyber defense, governance/risk/compliance, third-party risk and analytics for risk insights.";
+  if (n.includes("audit")) return "Audit & Assurance focuses on independent audits, assurance reviews and controls testing. Roles: Audit Analyst, A&A Assistant. Strong grounding in accounting/standards, data-enabled audits.";
+  if (n.includes("tax")) return "Tax delivers global compliance and reporting, indirect/direct tax, and transfer pricing. Roles: Tax Analyst/Consultant supporting global clients and technology-enabled tax operations.";
+  if (n.includes("techn")) return "Technology brings Software Engineering, Cloud Engineering, Data/AI, and Platform/DevOps together. Roles: Software Engineer, Data Engineer, Cloud Analyst, SRE/DevOps. Work: build scalable systems, cloud migrations, ML solutions.";
+  if (n.includes("financial")) return "Financial Advisory includes Valuation & Modeling, Forensic, Restructuring, and M&A Transaction Services. Roles: Analyst/Consultant working on deals, investigations and valuations.";
+  return "Deloitte USI practices include Consulting, Risk Advisory, Audit & Assurance, Tax, Technology and Financial Advisory.";
+}
+
+function discoverySuggestions(interest, degree, exp, city) {
+  const rec = [];
+  const add = (t) => rec.push(`• ${t}`);
+  const i = String(interest||"").toLowerCase();
+  if (/data|ai|ml|analytics/.test(i)) { add("Data Engineer / Analyst (SQL, Python, cloud data warehouses)"); add("Applied AI / ML Engineer (ML fundamentals, MLOps, Python)"); }
+  if (/cloud|devops|sre|platform/.test(i)) { add("Cloud Engineer (AWS/Azure/GCP, IaC)"); add("SRE/DevOps Engineer (Kubernetes, CI/CD, monitoring)"); }
+  if (/cyber/.test(i)) { add("Cyber Analyst (SOC, threat detection, incident response)"); add("Identity & Access Management / AppSec Consultant"); }
+  if (/erp|sap|workday|oracle/.test(i)) { add("SAP Associate Consultant (ABAP/Functional/HANA)"); add("Workday/Oracle Cloud Consultant"); }
+  if (/software|full|backend|frontend|mobile|ui|ux|testing|qa/.test(i)) { add("Software Engineer (Java/Node/.NET, React/Angular, testing)"); }
+  if (/audit|account/.test(i)) { add("Audit Analyst / Assurance Associate"); }
+  if (/risk|compliance|grc/.test(i)) { add("Risk Analyst / GRC Consultant"); }
+  if (/tax/.test(i)) { add("Tax Analyst (direct/indirect/TP)"); }
+  if (/strategy|human/.test(i)) { add("Business Analyst / Human Capital Analyst"); }
+  const links = [`Search roles: https://jobsindia.deloitte.com/search/?q=${encodeURIComponent(interest||"")}${city ? "&locationsearch="+encodeURIComponent(city):""}`];
+  return { rec, links };
+}
+
+function makeList(items) { return items.map((x, i) => `${i+1}. ${x}`).join("\n"); }
+
+app.post("/df-webhook", async (req, res) => {
+  try {
+    const qr = req.body.queryResult || {};
     const params = qr.parameters || {};
-    const intentName = qr.intent?.displayName || cxTag || "UNKNOWN";
+    const intent = qr.intent?.displayName || "UNKNOWN";
 
-    if (intentName === "Find Roles") {
-      const roles = mockRoles(params.practice, params.location);
-      const lines = [
-        `Here are ${params.practice || "Consulting"} roles in ${params.location || "Bengaluru"} (demo):`,
-        ...roles.map(r => `• ${r.title} — ${r.reqId}\n  ${r.applyUrl}`),
-        "\nDemo assistant. Not an official Deloitte system."
-      ];
-      return textResponse(res, lines.join("\n"));
+    if (intent === "USI Overview") {
+      const text = [
+        "Deloitte USI (U.S.-India) brings together professionals in India who collaborate with Deloitte’s global practices on consulting, technology, audit, risk, tax and advisory services.",
+        "Explore:",
+        bullet(LINKS.usi_overview)
+      ].join("\n");
+      return res.json({ fulfillmentText: text });
     }
 
-    if (intentName === "Eligibility Check") {
-      const verdict = eligibility(params.degree, params.grad_year, params.experience_years);
-      const next = verdict === "Likely eligible" ?
-        "Would you like me to list matching roles in your city?" :
-        "You can still explore openings or consider upskilling resources.";
-      return textResponse(res, `Result: ${verdict}.\n${next}\n(Demo assistant.)`);
+    if (intent === "Practice Info") {
+      const p = params.practice;
+      const summary = practiceSummary(p);
+      const links = LINKS.practices[p] || [];
+      const text = [summary, links.length ? "\nOfficial links:\n"+bullet(links) : ""].join("\n");
+      return res.json({ fulfillmentText: text.trim() });
     }
 
-    if (intentName === "Schedule Interview (Book)") {
-      const slots = nextSlots();
-      const lines = [
-        `Available slots (demo):`,
-        ...slots.map(s => `• ${s}`),
-        `Reply with your preferred date & time.`
-      ];
-      return textResponse(res, lines.join("\n"));
+    if (intent === "Locations & Offices") {
+      const text = ["USI delivery centers and offices are primarily in:", bullet(LINKS.locations), "\nLearn more:", bullet(LINKS.usi_overview)].join("\n");
+      return res.json({ fulfillmentText: text });
     }
 
-    if (intentName === "Schedule Interview (Pick Slot)") {
-      const ts = params.timeslot || "the selected time";
-      return textResponse(res, `Booked ${ts} (demo). A confirmation email will be sent.\nDemo assistant.`);
+    if (intent === "Culture & Benefits") {
+      const text = ["Life at Deloitte focuses on growth, inclusion and wellbeing. Expect mentorship, continuous learning, internal mobility, and communities (Women in Tech, Pride, etc.).", "Explore culture & inclusion pages:", bullet(LINKS.culture)].join("\n");
+      return res.json({ fulfillmentText: text });
     }
 
-    if (intentName === "Reschedule Interview") {
-      const ts = params.timeslot || "your new time";
-      return textResponse(res, `Rescheduled to ${ts} (demo). We'll send a new confirmation.\nDemo assistant.`);
+    if (intent === "Learning & Innovation") {
+      const text = ["USI invests in certifications (AWS/Azure/GCP, SAP, cybersecurity, analytics), Guild learning paths, internal bootcamps, and innovation programs (AI, Cloud, Industry 4.0).", "See more:", bullet(LINKS.innovation)].join("\n");
+      return res.json({ fulfillmentText: text });
     }
 
-    if (intentName === "Cancel Interview") {
-      return textResponse(res, `Your mock interview has been cancelled (demo). You'll receive a confirmation email.\nDemo assistant.`);
+    if (intent === "Hiring Programs") {
+      const text = ["Entry paths include campus hiring (analyst/solution analyst), internships, and off-campus lateral roles.", "Start here:", bullet(LINKS.hiring)].join("\n");
+      return res.json({ fulfillmentText: text });
     }
 
-    if (intentName === "Application Status") {
-      const id = params.application_id || "DL-0000-IN";
-      const status = statuses[Math.floor(Math.random()*statuses.length)];
-      return textResponse(res, `Status for ${id}: ${status} (demo).\nDemo assistant.`);
+    if (intent === "Search Roles") {
+      const { keyword, practice, location } = params;
+      const q = keyword || practice || "graduate analyst";
+      const result = await searchRoles(q, practice, location);
+      let out = `Here are resources for '${q}' ${location? "in "+location : ""}:\n${result.url}`;
+      if (result.results && result.results.length) {
+        out += "\n\nTop matches:\n" + result.results.map(r => `• ${r.title}\n  ${r.href}`).join("\n");
+      } else {
+        out += "\n\nOpen the link to view all current listings.";
+      }
+      out += "\n\nTip: Refine with 'search roles cloud in Hyderabad' or 'data roles Bengaluru'.";
+      return res.json({ fulfillmentText: out });
     }
 
-    if (intentName === "Contact HR / Handoff") {
-      const ticket = "HR-" + Math.floor(1000 + Math.random()*9000);
-      return textResponse(res, `I've created a demo ticket: ${ticket}. A team member will reach out.\nDemo assistant.`);
+    if (intent === "Discovery Interview - Collect") {
+      const { interest, degree, experience_level, location } = params;
+      const { rec, links } = discoverySuggestions(interest, degree, experience_level, location);
+      const text = [`Great — based on your interest in ${interest}, degree ${degree} and experience ${experience_level}${location? " for "+location:""}, here are starter pathways:`, rec.length ? makeList(rec) : "• Analyst/Consultant roles in the chosen practice", "\nUseful links:", bullet(links.concat(LINKS.hiring.slice(0,1)))].join("\n");
+      return res.json({ fulfillmentText: text });
     }
 
-    return textResponse(res, "I’m not sure how to help with that. Try: Find roles • Eligibility • Interview slots • Status • FAQs • Human handoff");
+    if (intent === "Contact & Events") {
+      const text = ["For official updates, webinars and campus engagements, follow the careers site and LinkedIn pages.", "Start at:", bullet(["https://www2.deloitte.com/in/en/careers.html","https://jobsindia.deloitte.com/"])].join("\n");
+      return res.json({ fulfillmentText: text });
+    }
+
+    return res.json({ fulfillmentText: "I can explain USI, practices, culture and learning, search open roles, or run a discovery interview. Try 'what is USI' or 'search cloud roles in Bengaluru'." });
   } catch (e) {
     console.error("Webhook error", e);
-    return textResponse(res, "An error occurred in the demo webhook.");
+    return res.json({ fulfillmentText: "Sorry, something went wrong fetching that info." });
   }
 });
 
+app.get("/", (_req, res) => res.send("USI Careers Concierge — Webhook OK"));
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`DF ES webhook listening on :${PORT}`));
+app.listen(PORT, () => console.log("USI Concierge webhook on :" + PORT));
